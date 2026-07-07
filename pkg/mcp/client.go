@@ -20,6 +20,7 @@ import (
 type Client struct {
 	Session       *Session
 	serverName    string
+	noTools       bool
 	toolOverrides ToolOverrides
 	toolPrefix    string
 }
@@ -157,6 +158,8 @@ type Server struct {
 	// If providing tool overrides, any tools not included will be implicitly disabled.
 	// If providing no tool overrides, all tools will be enabled.
 	ToolOverrides ToolOverrides `json:"toolOverrides,omitzero"`
+	// NoTools is used to differentiate between empty ToolOverrides meaning "all enabled" or "none enabled"
+	NoTools bool `json:"noTools,omitempty"`
 
 	// ToolPrefix is prepended to the name of every tool this server exposes
 	// (after any ToolOverrides rename). Incoming tool calls are stripped of the
@@ -380,6 +383,7 @@ func NewClient(ctx context.Context, serverName string, config Server, opts ...Cl
 	c := &Client{
 		Session:       session,
 		serverName:    serverName,
+		noTools:       config.NoTools,
 		toolOverrides: config.ToolOverrides,
 		toolPrefix:    config.ToolPrefix,
 	}
@@ -538,7 +542,7 @@ func (c *Client) ListTools(ctx context.Context) (*ListToolsResult, error) {
 	ctx, span := startOutboundSpan(ctx, "mcp.tools.list",
 		attribute.String("mcp.server.name", c.serverName),
 	)
-	if c.Session.InitializeResult.Capabilities.Tools == nil {
+	if c.noTools || c.Session.InitializeResult.Capabilities.Tools == nil {
 		finishOutboundSpan(span, nil)
 		return &ListToolsResult{}, nil
 	}
@@ -602,15 +606,31 @@ func (c CallOption) Merge(other CallOption) (result CallOption) {
 func (c *Client) Call(ctx context.Context, tool string, args any, opts ...CallOption) (result *CallToolResult, err error) {
 	opt := complete.Complete(opts...)
 	result = new(CallToolResult)
+	if c.noTools {
+		return result, fmt.Errorf("no tools allowed")
+	}
 
 	// Strip the per-server tool prefix before reverse-resolving any override
 	// rename — the upstream server only knows the original (or override) name.
 	tool = strings.TrimPrefix(tool, c.toolPrefix)
 
-	for name, o := range c.toolOverrides {
-		if o.Name != "" && tool == o.Name {
-			tool = name
-			break
+	// A non-empty ToolOverrides map is an allow-list: tools absent from it are
+	// hidden from tools/list and must not be callable by their upstream name.
+	if len(c.toolOverrides) > 0 {
+		found := false
+		for name, o := range c.toolOverrides {
+			if tool == name && (o.Name == "" || o.Name == tool) {
+				found = true
+				break
+			}
+			if o.Name != "" && tool == o.Name {
+				tool = name
+				found = true
+				break
+			}
+		}
+		if !found {
+			return result, fmt.Errorf("tool %q not found", tool)
 		}
 	}
 
